@@ -29,6 +29,9 @@ import type { RunApiInfo, Stage } from "../config.ts";
 import type { ResearchFailureCode } from "../research_failure.ts";
 import { MAX_STOP_BLOCKS, MAX_TOTAL_STOP_BLOCKS, StopGuard } from "../stop_guard.ts";
 import { DirectTransportError, chatCompletion, type ChatMessage } from "./direct_transport.ts";
+import fs from "node:fs";
+import { LEAN_WORKFLOW, buildRunDigest } from "./lean_context.ts";
+import { fetchNewsOnce, prepareXcheck } from "./lean_xcheck.ts";
 
 /** 单条工具结果喂回模型的上限。超了给结构化说明,不截断 JSON。 */
 const TOOL_RESULT_CAP = 24_000;
@@ -62,6 +65,11 @@ export interface DirectStageAgentOptions {
   observer?: (ev: Record<string, unknown>) => void;
   /** 外部取消 */
   signal?: AbortSignal;
+  /**
+   * 上下文模式。"lean" = 省 token:程序预读并压缩运行目录塞进提示词,模型一轮并行算、一轮写,
+   * 写成功且收工检查放行即由程序收尾;"classic" = 原版逐个翻文件的工具循环。
+   */
+  contextMode?: "classic" | "lean";
 }
 
 /** 把工具返回值转成喂给模型的文本;过大时给结构化说明而不是坏 JSON */
@@ -118,7 +126,8 @@ export class DirectStageAgent implements AgentRunner {
     const t0 = Date.now();
     const { api, apiKey } = this.opts;
     const model = api.model;
-    const maxRounds = this.opts.maxToolRounds ?? 24;
+    const lean = this.opts.contextMode === "lean";
+    const maxRounds = this.opts.maxToolRounds ?? (lean ? 8 : 24);
     const guard = new StopGuard(this.opts.toolCtx.runDir, stage, this.opts.stopLimits ?? { maxIdle: MAX_STOP_BLOCKS, maxTotal: MAX_TOTAL_STOP_BLOCKS });
     let stopTerminated: string | null = null;
 
@@ -133,7 +142,27 @@ export class DirectStageAgent implements AgentRunner {
       this.log(stage, "direct.schema_downgraded", { attempt, unverified: !api.verified });
     }
 
-    const messages: ChatMessage[] = [{ role: "user", content: shaped.prompt }];
+    let firstPrompt = shaped.prompt;
+    if (lean) {
+      const runDir = this.opts.toolCtx.runDir;
+      const dg = buildRunDigest(runDir, stage);
+      let man: { symbol?: string; market?: string } = {};
+      try { man = JSON.parse(fs.readFileSync(path.join(runDir, "manifest.json"), "utf8")); } catch { /* 没有就不做外部核对 */ }
+      let extra = "";
+      try {
+        const xc = await prepareXcheck(runDir, String(man.symbol ?? ""), String(man.market ?? ""), this.opts.toolCtx.python);
+        extra += xc.digest;
+        this.log(stage, "lean.xcheck", { attempt, groups: xc.checks, over_threshold: xc.bad, external_errors: xc.external_errors });
+      } catch (e) { this.log(stage, "lean.xcheck_failed", { attempt, message: e instanceof Error ? e.message : String(e) }); }
+      if (stage === "risk" || stage === "report") {
+        const nw = await fetchNewsOnce({ runDir, symbol: String(man.symbol ?? ""), market: String(man.market ?? ""), baseURL: api.baseURL, apiKey, model });
+        if (!nw.cached) this.log(stage, "lean.news", { attempt, usage: nw.usage, error: nw.error ?? null });
+        extra += nw.digest;
+      }
+      firstPrompt = `${shaped.prompt}\n\n${LEAN_WORKFLOW}\n\n${extra}\n${dg.text}`;
+      this.log(stage, "lean.digest", { attempt, chars: dg.text.length, files: dg.files.length, truncated: dg.truncated });
+    }
+    const messages: ChatMessage[] = [{ role: "user", content: firstPrompt }];
     const toolSpecs = runToolsAsFunctionSpecs();
     const fileChanges: string[] = [];
     // 没有 shell,`commands` 如实留空。
@@ -146,7 +175,7 @@ export class DirectStageAgent implements AgentRunner {
     let failed: string | null = null;
     let failureCode: ResearchFailureCode | undefined;
 
-    this.log(stage, "direct.turn_start", { attempt, model, structured_output: api.structuredOutput, max_tool_rounds: maxRounds });
+    this.log(stage, "direct.turn_start", { attempt, model, structured_output: api.structuredOutput, max_tool_rounds: maxRounds, context_mode: lean ? "lean" : "classic" });
 
     /** 工具循环是否已自然结束(模型不再要工具且收工检查放行 / 终止);false = 撞了轮数上限或请求失败 */
     let settled = false;
@@ -183,7 +212,7 @@ export class DirectStageAgent implements AgentRunner {
       usage = mergeUsage(usage, reply.usage);
       messages.push(reply.message);
       const calls = reply.message.tool_calls ?? [];
-      this.log(stage, "direct.model_reply", { attempt, round, finish_reason: reply.finishReason, tool_calls: calls.length, duration_ms: reply.durationMs });
+      this.log(stage, "direct.model_reply", { attempt, round, finish_reason: reply.finishReason, tool_calls: calls.length, duration_ms: reply.durationMs, usage: reply.usage ?? null });
 
       if (calls.length === 0) {
         // 模型想收工:先过收工检查
@@ -204,6 +233,7 @@ export class DirectStageAgent implements AgentRunner {
         break;
       }
       toolRounds += 1;
+      let wroteThisRound = false;
 
       for (const call of calls) {
         const name = call.function?.name ?? "";
@@ -223,6 +253,7 @@ export class DirectStageAgent implements AgentRunner {
           //    "改写了受保护的编排产物",于是每次计算都变成违规。
           for (const abs of writtenPathsOf(this.opts.toolCtx.runDir, name, args, value)) if (!fileChanges.includes(abs)) fileChanges.push(abs);
           this.log(stage, "direct.tool_ok", { attempt, round, tool: name });
+          if (name === "write_stage" || name === "write_report") wroteThisRound = true;
           messages.push({ role: "tool", tool_call_id: call.id, content: toolResultText(value) });
         } catch (e) {
           // ② 工具失败回喂结构化错误,不中断循环 —— 让模型换个招继续(第一版 tools.py 的做法,值得继承)
@@ -232,6 +263,23 @@ export class DirectStageAgent implements AgentRunner {
           messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify({ error: code, message }) });
         }
       }
+      // lean:本轮写了产物 ⇒ 程序先过收工检查;放行就直接收尾,省掉"再问一次模型要汇报 JSON"那一轮
+      if (lean && wroteThisRound) {
+        const verdict = guard.check();
+        if (verdict.decision === "block") {
+          this.log(stage, "stop_guard.block", { attempt, round, idle_streak: verdict.idleStreak, blocks: verdict.blocks, problems: verdict.problems, lean: true });
+          messages.push({ role: "user", content: verdict.message });
+          continue;
+        }
+        if (verdict.decision === "terminate") {
+          stopTerminated = verdict.reason;
+          this.log(stage, "stop_guard.terminate", { attempt, round, idle_streak: verdict.idleStreak, blocks: verdict.blocks, problems: verdict.problems });
+        }
+        settled = true;
+        finalResponse = leanFinalResponse(this.opts.toolCtx.runDir, stage);
+        this.log(stage, "lean.auto_finalized", { attempt, round });
+        break;
+      }
     }
 
     // ── 收尾:要一份规定格式的汇报 ──
@@ -240,7 +288,7 @@ export class DirectStageAgent implements AgentRunner {
     //  ② 撞了轮数上限 —— 模型还想继续调工具,得叫停并让它用现有材料收尾,否则整个 turn 颗粒无收。
     // (提示词模式下若模型已自然收尾,它的回复本身就该是那个 JSON,不必多花一次调用。)
     // 收工检查已终止本轮 ⇒ 这一轮按失败补跑,不再要汇报。
-    const needFinalize = !failed && !stopTerminated && (responseFormat ? true : !settled);
+    const needFinalize = !failed && !stopTerminated && (responseFormat && !lean ? true : !settled);
     if (needFinalize) {
       if (!settled) this.log(stage, "direct.tool_rounds_exhausted", { attempt, rounds: maxRounds });
       messages.push({
@@ -300,3 +348,13 @@ export function writtenPathsOf(runDir: string, name: string, args: unknown, valu
 
 /** registry 里有几个写类工具,writtenPathsOf 就得认几个 —— 新增写类工具而忘了在这里认领,变更会静默漏记 */
 export const WRITE_TOOL_NAMES: readonly string[] = RUN_TOOLS.filter((t) => t.name === "calculate" || t.name.startsWith("write_")).map((t) => t.name);
+
+/** lean 模式由程序代写的收尾汇报(与提示词规定的最终 JSON 同形),状态取自刚落盘的阶段产物 */
+function leanFinalResponse(runDir: string, stage: Stage): string {
+  let status = "incomplete";
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(runDir, "stages", `${stage}.json`), "utf8")) as { status?: string };
+    if (typeof j.status === "string") status = j.status;
+  } catch { /* 读不到就按 incomplete 报 */ }
+  return JSON.stringify({ stage_file_written: true, status, notes: "lean 模式:产物写入且收工检查放行,由程序收尾" });
+}

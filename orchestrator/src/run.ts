@@ -136,6 +136,12 @@ export function configFromArgs(args: Record<string, string | boolean>, env: Node
   const noAgent = args["no-agent"] === true;
   const requestMeta = String(env[REQUEST_LLM_META_VAR] ?? "").trim();
   const cliModel = optionValue(args, "model");
+  // 省 token 模式开关:--context-mode lean|classic(或环境变量 VRA_CONTEXT_MODE);缺省 classic = 原版行为
+  const contextMode = str(args["context-mode"]);
+  if (contextMode !== undefined) {
+    if (contextMode !== "lean" && contextMode !== "classic") throw new Error(`--context-mode 只能是 lean 或 classic,收到 ${contextMode}`);
+    env.VRA_CONTEXT_MODE = contextMode;
+  }
   // 干跑不解析大脑:没配 AI 来源、缺 key 都不影响只跑编排与校验
   let runtime: ResolvedRuntimeProvider | null = null;
   let explicitModel: string | undefined;
@@ -248,6 +254,7 @@ export async function makeEngine(cfg: RunConfig, eventsPath: string, observer?: 
       secrets: secretsFor(cfg, env),
       requestTimeoutMs: cfg.turnTimeoutMs,
       observer,
+      contextMode: env.VRA_CONTEXT_MODE === "lean" ? "lean" : "classic",
     });
     const runtime: EngineRuntime = { kind: "direct", version: `direct-api/${api.provider}/${api.model}`, binary: null, model: api.model };
     return { runner, capabilities: directCapabilities(api.structuredOutput), runtime };
